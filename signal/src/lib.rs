@@ -2,15 +2,30 @@
 
 #[macro_use]
 extern crate log;
+extern crate alloc;
 
 mod arch;
 pub use arch::rt_sigreturn;
 
+use core::mem;
+use alloc::sync::Arc;
 use taskctx::Tid;
 use task::{SigInfo, SigAction, SA_RESTORER, SA_RESTART};
-use axerrno::LinuxResult;
-use task::{SIGKILL, SIGSTOP};
+use axerrno::{linux_err, LinuxError, LinuxResult};
+use task::{SIGKILL, SIGSTOP, TaskStruct};
 use axhal::arch::TrapFrame;
+use core::sync::atomic::Ordering;
+use taskctx::TIF_SIGPENDING;
+use taskctx::{_TIF_SIGPENDING, _TIF_NOTIFY_SIGNAL};
+use axtype::ffz;
+
+const SIG_DFL: usize = 0;   // default signal handling
+//const SIG_IGN: usize = 1;   // ignore signal
+//const SIG_ERR: usize = -1;  // error return from signal
+
+const SIG_BLOCK:    usize = 0; // for blocking signals
+const SIG_UNBLOCK:  usize = 1; // for unblocking signals
+const SIG_SETMASK:  usize = 2; // for setting the signal mask
 
 /// si_code values
 /// Digital reserves positive values for kernel-generated signals.
@@ -56,7 +71,7 @@ struct KSignal {
 //#define SI_FROMKERNEL(siptr)    ((siptr)->si_code > 0)
 
 pub fn kill(tid: Tid, sig: usize) -> usize {
-    info!("kill tid {} sig {}", tid, sig);
+    debug!("kill tid {} sig {}", tid, sig);
     assert!(tid > 0);
     let info = prepare_kill_siginfo(sig, tid);
     kill_proc_info(sig, info, tid).unwrap();
@@ -82,33 +97,53 @@ fn kill_proc_info(sig: usize, info: SigInfo, tid: Tid) -> LinuxResult {
 }
 
 fn do_send_sig_info(sig: usize, info: SigInfo, tid: Tid) -> LinuxResult {
-    let task = task::get_task(tid).unwrap();
+    debug!("do_send_sig_info tid {:#x} sig {} ...", tid, sig);
+    let task = if let Some(tsk) = task::get_task(tid) {
+        tsk
+    } else {
+        warn!("No task [{:#x}].", tid);
+        return Ok(());
+    };
     let mut pending = task.sigpending.lock();
     pending.list.push(info);
     sigaddset(&mut pending.signal, sig);
-    info!("do_send_sig_info tid {} sig {} ok!", tid, sig);
+    signal_wake_up(task.clone());
+    debug!("do_send_sig_info tid {:#x} sig {} ok!", tid, sig);
     Ok(())
 }
 
-#[inline]
-fn sigmask(sig: usize) -> usize {
-    1 << (sig - 1)
+fn signal_wake_up(task: Arc<TaskStruct>) {
+    task.sched_info.set_tsk_thread_flag(TIF_SIGPENDING)
 }
 
 #[inline]
-fn sigaddset(set: &mut usize, sig: usize) {
-    *set |= 1 << (sig - 1);
+fn sigmask(signo: usize) -> u64 {
+    1 << (signo - 1)
 }
 
 #[inline]
-fn sigdelsetmask(set: &mut usize, mask: usize) {
+fn sigaddset(set: &mut u64, signo: usize) {
+    *set |= 1 << (signo - 1);
+}
+
+#[inline]
+fn sigdelsetmask(set: &mut u64, mask: u64) {
     *set &= !mask;
+}
+
+#[inline]
+fn sigorsets(rset: &mut u64, set1: u64, set2: u64) {
+    *rset = set1 | set2;
+}
+
+#[inline]
+fn sigandnsets(rset: &mut u64, set1: u64, set2: u64) {
+    *rset = set1 & set2;
 }
 
 pub fn rt_sigaction(sig: usize, act: usize, oact: usize, sigsetsize: usize) -> usize {
     assert_eq!(sigsetsize, 8);
-    info!("rt_sigaction: sig {} act {:#X} oact {:#X}", sig, act, oact);
-    assert!(act != 0);
+    debug!("rt_sigaction: sig {} act {:#X} oact {:#X}", sig, act, oact);
 
     let task = task::current();
 
@@ -122,22 +157,29 @@ pub fn rt_sigaction(sig: usize, act: usize, oact: usize, sigsetsize: usize) -> u
     if act != 0 {
         let act = unsafe { &(*(act as *const SigAction)) };
         info!("act: {:#X} {:#X} {:#X}", act.handler, act.flags, act.mask);
-        assert!((act.flags & SA_RESTART) != 0);
         assert!((act.flags & SA_RESTORER) == 0);
 
         let mut kact = act.clone();
         sigdelsetmask(&mut kact.mask, sigmask(SIGKILL) | sigmask(SIGSTOP));
-        info!("get_signal signo {} handler {:#X}", sig, kact.handler);
+        debug!("get_signal signo {} handler {:#X}", sig, kact.handler);
         task.sighand.lock().action[sig - 1] = kact;
     }
     0
 }
 
-pub fn do_signal(tf: &mut TrapFrame) {
-    info!("do_signal ...");
+pub fn do_signal(tf: &mut TrapFrame, cause: usize) {
+    debug!("do_signal ...");
+
+    {
+        let thread_info_flags = taskctx::current_ctx().flags.load(Ordering::Relaxed);
+        if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) == 0 {
+            return;
+        }
+    }
+
     if let Some(ksig) = get_signal() {
         /* Actually deliver the signal */
-        arch::handle_signal(&ksig, tf);
+        arch::handle_signal(&ksig, tf, cause);
         return;
     }
 
@@ -146,13 +188,43 @@ pub fn do_signal(tf: &mut TrapFrame) {
 
 fn get_signal() -> Option<KSignal> {
     let task = task::current();
-    let _info = task.sigpending.lock().list.pop()?;
-    let signo = _info.signo as usize;
+    let blocked = task.blocked.load(Ordering::Relaxed);
+    let mut sigpending = task.sigpending.lock();
+    let signo = next_signal(sigpending.signal, blocked)?;
+    let (idx, _) = sigpending.list.iter().enumerate().find(|(_, &ref item)| {
+        item.signo == signo as i32
+    })?;
+    debug!("next_signal: index {}, signo {}", idx, signo);
+
+    let _info = sigpending.list.remove(idx);
+    assert_eq!(signo, _info.signo as usize);
 
     let action = task.sighand.lock().action[signo - 1];
-    assert!(action.handler != 0);
-    info!("get_signal signo {} handler {:#X}", signo, action.handler);
-    Some(KSignal {action, _info, signo})
+    if action.handler != SIG_DFL {
+        debug!("get_signal signo {} handler {:#X}", signo, action.handler);
+        return Some(KSignal {action, _info, signo});
+    }
+
+    let leader = if let Some(leader) = &task.sched_info.group_leader {
+        force_sig_fault(leader.tid(), signo, 0, 0);
+        leader
+    } else {
+        &task.sched_info
+    };
+
+    for tid in leader.siblings.lock().iter() {
+        if *tid == task.tid() {
+            continue;
+        }
+        force_sig_fault(*tid, signo, 0, 0);
+    }
+
+    sys::do_group_exit(signo as u32)
+}
+
+fn next_signal(mut sigset: u64, blocked: u64) -> Option<usize> {
+    sigdelsetmask(&mut sigset, blocked);
+    Some(ffz(sigset)? + 1)
 }
 
 fn restore_sigcontext(tf: &mut TrapFrame, frame: &RTSigFrame) {
@@ -165,8 +237,8 @@ fn setup_sigcontext(frame: &mut RTSigFrame, tf: &TrapFrame) {
     // Todo: Save the floating-point state.
 }
 
-pub fn force_sig_fault(signo: usize, code: usize, _addr: usize) {
-    let tid = taskctx::current_ctx().tid();
+pub fn force_sig_fault(tid: usize, signo: usize, code: usize, _addr: usize) {
+    //let tid = taskctx::current_ctx().tid();
     let info = SigInfo {
         signo: signo as i32,
         errno: 0,
@@ -174,6 +246,69 @@ pub fn force_sig_fault(signo: usize, code: usize, _addr: usize) {
         tid: tid,
     };
 
-    info!("force tid {} sig {}", tid, signo);
+    debug!("force tid {} sig {}", tid, signo);
     do_send_sig_info(signo, info, tid).unwrap();
+}
+
+pub fn rt_sigprocmask(how: usize, nset: usize, oset: usize, sigsetsize: usize) -> usize {
+    info!(
+        "impl sigprocmask how {} nset {:#X} oset {:#X} size {} tid {}",
+        how, nset, oset, sigsetsize, task::current().tid(),
+    );
+
+    /* XXX: Don't preclude handling different sized sigset_t's.  */
+    if sigsetsize != mem::size_of::<u64>() {
+        return linux_err!(EINVAL);
+    }
+
+    let old_set = task::current().blocked.load(Ordering::Relaxed);
+    if nset != 0 {
+        let nset = nset as *const u64;
+        let mut new_set = unsafe { *nset };
+        sigdelsetmask(&mut new_set, sigmask(SIGKILL)|sigmask(SIGSTOP));
+        sigprocmask(how, new_set);
+    }
+    if oset != 0 {
+        let oset = oset as *mut u64;
+        unsafe { *oset = old_set };
+    }
+    0
+}
+
+//
+// This is also useful for kernel threads that want to temporarily
+// (or permanently) block certain signals.
+//
+// NOTE! Unlike the user-mode sys_sigprocmask(), the kernel
+// interface happily blocks "unblockable" signals like SIGKILL
+// and friends.
+//
+fn sigprocmask(how: usize, set: u64) {
+    let blocked = task::current().blocked.load(Ordering::Relaxed);
+
+    let mut newset = 0;
+    match how {
+        SIG_BLOCK => sigorsets(&mut newset, blocked, set),
+        SIG_UNBLOCK => sigandnsets(&mut newset, blocked, set),
+        SIG_SETMASK => { newset = set },
+        _ => panic!("invalid how"),
+    };
+
+    __set_current_blocked(newset);
+}
+
+fn __set_current_blocked(newset: u64) {
+    let blocked = task::current().blocked.load(Ordering::Relaxed);
+
+    /*
+     * In case the signal mask hasn't changed, there is nothing we need
+     * to do. The current->blocked shouldn't be modified by other task.
+     */
+    if blocked == newset {
+        return;
+    }
+
+    //spin_lock_irq(&tsk->sighand->siglock);
+    task::current().blocked.store(newset, Ordering::Relaxed);
+    //spin_unlock_irq(&tsk->sighand->siglock);
 }
